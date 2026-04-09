@@ -1,0 +1,13 @@
+{
+  "Name": "FileTraceSKSE",
+  "Author": "gkd2323c",
+  "Description": "Track file open events and stream to log",
+  "Version": "1.0.0",
+  "Template": "basic",
+  "TargetVersions": [
+    0,
+    1
+  ],
+  "OutputDirectory": "",
+  "PapyrusFunctions": []
+}
