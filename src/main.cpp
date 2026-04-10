@@ -1148,11 +1148,9 @@ extern "C" __declspec(dllexport) constinit auto SKSEPlugin_Version = []() {
     data.PluginVersion(REL::Version{ 1, 0, 0 });
     data.PluginName(PLUGIN_NAME);
     data.AuthorName(PLUGIN_AUTHOR);
+    data.UsesNoStructs();
     data.UsesAddressLibrary();
-    data.CompatibleVersions({
-        SKSE::RUNTIME_SSE_LATEST_AE,
-        SKSE::RUNTIME_SSE_LATEST_SE
-    });
+    data.UsesStructsPost629();
     return data;
 }();
 
