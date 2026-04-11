@@ -1,25 +1,15 @@
 # FileTraceSKSE
 
-用于调试 Skyrim 文件加载行为的 SKSE 插件。  
-V1 目标是追踪 `CreateFileW/CreateFileA`，并将事件异步写入可实时跟读的日志文件。
+用于调试 Skyrim / SKSE 的文件加载行为。  
+插件会异步记录文件访问事件，减少对游戏线程的干扰。
 
-## 功能
+## 主要功能
 
-- Hook `CreateFileW` 与 `CreateFileA`（优先 `KernelBase`，失败回退 `Kernel32`）
-- Hook 线程只做轻量采样与入队，不做同步落盘
-- 后台线程异步批量写日志（`CreateFileW + WriteFile`，`FILE_SHARE_READ`）
-- UTF-8 INI 配置（`SimpleIniW`）
-- 路径过滤：`DataRoot/ExtraRoots` 优先，支持目录段兜底，最终按扩展名白名单过滤
-- 队列打满时丢弃并输出 `[WARN] dropped=...` 可观测告警
-
-## 构建要求
-
-- CMake 3.24+
-- MSVC Build Tools（x64 C++）
-- 首次构建需要联网下载依赖：
-  - CommonLibSSE-NG
-  - MinHook
-  - SimpleIni
+- Hook `CreateFileW` / `CreateFileA`，记录实际文件打开。
+- 新增 `BSResourceNiBinaryStream::ctor` Hook，可追踪 BSA 封装包中的资源条目请求。
+- 异步队列写日志，避免在 Hook 内做重 I/O。
+- 支持扩展名白名单，或通过 `IncludeAllExtensions=true` 监听所有后缀。
+- 支持路径过滤、失败事件记录、最小时延过滤和队列丢弃告警。
 
 ## 构建
 
@@ -28,7 +18,7 @@ cmake -B build -S .
 cmake --build build --config Release
 ```
 
-输出 DLL：
+输出：
 
 `build/Release/FileTraceSKSE.dll`
 
@@ -36,33 +26,25 @@ cmake --build build --config Release
 
 1. 复制 `FileTraceSKSE.dll` 到：
    - `<Skyrim>/Data/SKSE/Plugins/`
-2. 复制 `FileTraceSKSE.ini` 到同目录：
+2. 复制 `FileTraceSKSE.ini` 到：
    - `<Skyrim>/Data/SKSE/Plugins/FileTraceSKSE.ini`
-3. 用 SKSE 启动游戏
 
-## 日志位置
-
-默认日志目录（可配置）：
+## 默认日志目录
 
 `C:\Users\<用户名>\Documents\My Games\Skyrim Special Edition\SKSE`
 
-日志文件名格式：
+日志文件名示例：
 
 `FileTraceSKSE_yyyyMMdd_HHmmss_pid<id>.log`
 
-可用 PowerShell 实时跟读：
+## 配置文件
 
-```powershell
-Get-Content "C:\\Users\\<用户名>\\Documents\\My Games\\Skyrim Special Edition\\SKSE\\<logfile>.log" -Wait
-```
-
-## 配置
-
-配置文件：`FileTraceSKSE.ini`（UTF-8）
+`FileTraceSKSE.ini`（UTF-8）：
 
 ```ini
 [FileTraceSKSE]
 Enabled=true
+TraceBsaEntries=true
 DataRoot=auto
 ExtraRoots=
 SegmentFallbackEnabled=true
@@ -77,30 +59,28 @@ LogDir=auto
 
 字段说明：
 
-- `Enabled`：总开关
-- `DataRoot`：`auto` 时自动推导 `<GameRoot>/Data`
-- `ExtraRoots`：额外根目录，使用 `;` 分隔
-- `SegmentFallbackEnabled`：根目录未命中时是否启用目录段兜底
-- `IncludeAllExtensions`：是否监听所有后缀文件（开启后忽略 `IncludeExtensions` 白名单）
-- `IncludeExtensions`：扩展名白名单（`|` 分隔）
-- `QueueCapacity`：有界队列容量（满则丢弃并计数）
-- `FlushIntervalMs`：后台线程写盘周期
-- `MinDurationMs`：最小记录阈值（句柄打开耗时）
-- `LogFailedOpen`：是否记录打开失败事件
-- `LogDir`：日志目录（`auto` 默认到 `C:\Users\<用户名>\Documents\My Games\Skyrim Special Edition\SKSE`）
+- `Enabled`：总开关。
+- `TraceBsaEntries`：是否追踪 BSA 内部资源条目（通过资源系统层 Hook）。
+- `DataRoot`：`auto` 时自动推导为 `<GameRoot>/Data`。
+- `ExtraRoots`：额外根目录，使用 `;` 分隔。
+- `SegmentFallbackEnabled`：根目录未命中时，是否按常见资源目录段兜底。
+- `IncludeAllExtensions`：开启后忽略 `IncludeExtensions` 白名单。
+- `IncludeExtensions`：扩展名白名单（`|` 分隔）。
+- `QueueCapacity`：异步队列容量。
+- `FlushIntervalMs`：后台批量刷新间隔。
+- `MinDurationMs`：最小时延过滤阈值。
+- `LogFailedOpen`：是否记录失败事件。
+- `LogDir`：日志目录（`auto` 使用默认文档目录）。
 
 ## 日志格式
 
-Header 后每行字段顺序固定：
+日志头后每行字段：
 
-`timestamp | tid | success | duration_ms | access_text | share_mode_hex | creation_disp | last_error | normalized_path`
+`timestamp | tid | source | success | duration_ms | access_text | share_mode_hex | creation_disp | last_error | normalized_path | context`
 
-队列丢弃统计行：
+- `source=win32_open`：来自 `CreateFile`。
+- `source=bsa_entry`：来自资源系统条目请求（可覆盖 BSA 资源读取场景）。
+
+队列丢弃告警示例：
 
 `[WARN] dropped=<N> reason=queue_full capacity=<C>`
-
-## V1 边界
-
-- 不追踪 `NtCreateFile/NtOpenFile`
-- 不追踪 BSA 内部条目路径
-- INI 启动时读取一次，运行期不热重载

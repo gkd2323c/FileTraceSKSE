@@ -47,12 +47,19 @@ namespace
 
     using CreateFileW_t = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
     using CreateFileA_t = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+    using BSResourceNiBinaryStreamCtor_t = RE::BSResourceNiBinaryStream* (*)(
+        RE::BSResourceNiBinaryStream*,
+        const char*,
+        bool,
+        RE::BSResource::Location*);
 
     HMODULE g_moduleHandle = nullptr;
     CreateFileW_t g_originalCreateFileW = ::CreateFileW;
     CreateFileA_t g_originalCreateFileA = ::CreateFileA;
+    BSResourceNiBinaryStreamCtor_t g_originalBSResourceNiBinaryStreamCtor = nullptr;
     LPVOID g_createFileWTarget = nullptr;
     LPVOID g_createFileATarget = nullptr;
+    LPVOID g_bsResourceNiBinaryStreamCtorTarget = nullptr;
 
     std::atomic<bool> g_runtimeEnabled{ false };
     std::atomic<bool> g_hooksEnabled{ false };
@@ -64,6 +71,7 @@ namespace
     struct ConfigSnapshot
     {
         bool enabled = true;
+        bool traceBsaEntries = true;
         std::filesystem::path dataRoot;
         std::vector<std::filesystem::path> extraRoots;
         bool segmentFallbackEnabled = true;
@@ -77,10 +85,17 @@ namespace
         std::filesystem::path iniPath;
     };
 
+    enum class EventSource
+    {
+        kWin32Open,
+        kBsaEntry
+    };
+
     struct RawEvent
     {
         std::chrono::system_clock::time_point timestamp;
         std::uint32_t threadId = 0;
+        EventSource source = EventSource::kWin32Open;
         bool success = false;
         std::uint32_t durationMs = 0;
         DWORD desiredAccess = 0;
@@ -88,6 +103,7 @@ namespace
         DWORD creationDisposition = 0;
         DWORD lastError = 0;
         std::wstring path;
+        std::wstring context;
     };
 
     ConfigSnapshot g_config{};
@@ -324,6 +340,9 @@ namespace
         if (const auto* v = GetIniValue(ini, L"Enabled")) {
             cfg.enabled = ParseBool(v, cfg.enabled);
         }
+        if (const auto* v = GetIniValue(ini, L"TraceBsaEntries")) {
+            cfg.traceBsaEntries = ParseBool(v, cfg.traceBsaEntries);
+        }
         if (const auto* v = GetIniValue(ini, L"SegmentFallbackEnabled")) {
             cfg.segmentFallbackEnabled = ParseBool(v, cfg.segmentFallbackEnabled);
         }
@@ -398,6 +417,44 @@ namespace
                << std::setfill('0')
                << static_cast<int>(ms.count() % 1000);
         return stream.str();
+    }
+
+    std::string EventSourceToText(EventSource source)
+    {
+        switch (source) {
+            case EventSource::kWin32Open:
+                return "win32_open";
+            case EventSource::kBsaEntry:
+                return "bsa_entry";
+            default:
+                return "unknown";
+        }
+    }
+
+    bool IsAbsolutePathLike(std::wstring_view path)
+    {
+        if (path.size() >= 2 && std::iswalpha(path[0]) != 0 && path[1] == L':') {
+            return true;
+        }
+        return StartsWith(path, L"\\\\");
+    }
+
+    std::wstring ResolveResourcePathForLog(std::wstring_view resourcePath)
+    {
+        std::wstring path(resourcePath);
+        std::replace(path.begin(), path.end(), L'/', L'\\');
+        if (path.empty() || IsAbsolutePathLike(path)) {
+            return path;
+        }
+
+        while (!path.empty() && (path.front() == L'\\' || path.front() == L'/')) {
+            path.erase(path.begin());
+        }
+        if (path.empty()) {
+            return {};
+        }
+
+        return (g_config.dataRoot / path).wstring();
     }
 
     std::string AccessFlagsToText(DWORD desiredAccess)
@@ -696,10 +753,11 @@ namespace
         line << "# FileTraceSKSE version=" << PLUGIN_VERSION
              << " pid=" << ::GetCurrentProcessId()
              << " data_root=" << WideToUtf8(_config.dataRoot.wstring())
+             << " trace_bsa_entries=" << (_config.traceBsaEntries ? "1" : "0")
              << " queue_capacity=" << _config.queueCapacity
              << " flush_interval_ms=" << _config.flushIntervalMs
              << "\r\n";
-        line << "# timestamp | tid | success | duration_ms | access_text | share_mode_hex | creation_disp | last_error | normalized_path\r\n";
+        line << "# timestamp | tid | source | success | duration_ms | access_text | share_mode_hex | creation_disp | last_error | normalized_path | context\r\n";
         WriteRaw(line.str());
     }
 
@@ -719,9 +777,12 @@ namespace
 
     std::string AsyncLogger::BuildEventLine(const RawEvent& event, const std::wstring& normalizedPath) const
     {
+        const std::string context = event.context.empty() ? "-" : WideToUtf8(event.context);
+
         std::ostringstream line;
         line << FormatTimestamp(event.timestamp)
              << " | " << event.threadId
+             << " | " << EventSourceToText(event.source)
              << " | " << (event.success ? "1" : "0")
              << " | " << event.durationMs
              << " | " << AccessFlagsToText(event.desiredAccess)
@@ -729,6 +790,7 @@ namespace
              << " | " << CreationDispositionToText(event.creationDisposition)
              << " | " << event.lastError
              << " | " << WideToUtf8(normalizedPath)
+             << " | " << context
              << "\r\n";
         return line.str();
     }
@@ -858,6 +920,12 @@ namespace
         DWORD flagsAndAttributes,
         HANDLE templateFile);
 
+    RE::BSResourceNiBinaryStream* HookedBSResourceNiBinaryStreamCtor(
+        RE::BSResourceNiBinaryStream* self,
+        const char* name,
+        bool writeable,
+        RE::BSResource::Location* optionalStart);
+
     FARPROC ResolveCreateFileProcAddress(const char* procName)
     {
         static constexpr std::array<const wchar_t*, 2> modules{
@@ -899,6 +967,16 @@ namespace
             return false;
         }
 
+        if (g_config.traceBsaEntries) {
+            g_bsResourceNiBinaryStreamCtorTarget = reinterpret_cast<LPVOID>(
+                REL::Relocation<std::uintptr_t>(RE::Offset::BSResourceNiBinaryStream::Ctor).address());
+            if (g_bsResourceNiBinaryStreamCtorTarget == nullptr) {
+                return false;
+            }
+        } else {
+            g_bsResourceNiBinaryStreamCtorTarget = nullptr;
+        }
+
         const auto statusW = MH_CreateHook(
             g_createFileWTarget,
             reinterpret_cast<LPVOID>(&HookedCreateFileW),
@@ -916,14 +994,37 @@ namespace
             return false;
         }
 
+        if (g_bsResourceNiBinaryStreamCtorTarget != nullptr) {
+            const auto statusCtor = MH_CreateHook(
+                g_bsResourceNiBinaryStreamCtorTarget,
+                reinterpret_cast<LPVOID>(&HookedBSResourceNiBinaryStreamCtor),
+                reinterpret_cast<LPVOID*>(&g_originalBSResourceNiBinaryStreamCtor));
+            if (statusCtor != MH_OK && statusCtor != MH_ERROR_ALREADY_CREATED) {
+                MH_RemoveHook(g_createFileWTarget);
+                MH_RemoveHook(g_createFileATarget);
+                return false;
+            }
+        }
+
         const auto enableW = MH_EnableHook(g_createFileWTarget);
         const auto enableA = MH_EnableHook(g_createFileATarget);
+        MH_STATUS enableCtor = MH_OK;
+        if (g_bsResourceNiBinaryStreamCtorTarget != nullptr) {
+            enableCtor = MH_EnableHook(g_bsResourceNiBinaryStreamCtorTarget);
+        }
         if ((enableW != MH_OK && enableW != MH_ERROR_ENABLED) ||
-            (enableA != MH_OK && enableA != MH_ERROR_ENABLED)) {
+            (enableA != MH_OK && enableA != MH_ERROR_ENABLED) ||
+            (enableCtor != MH_OK && enableCtor != MH_ERROR_ENABLED)) {
             MH_DisableHook(g_createFileWTarget);
             MH_DisableHook(g_createFileATarget);
+            if (g_bsResourceNiBinaryStreamCtorTarget != nullptr) {
+                MH_DisableHook(g_bsResourceNiBinaryStreamCtorTarget);
+            }
             MH_RemoveHook(g_createFileWTarget);
             MH_RemoveHook(g_createFileATarget);
+            if (g_bsResourceNiBinaryStreamCtorTarget != nullptr) {
+                MH_RemoveHook(g_bsResourceNiBinaryStreamCtorTarget);
+            }
             return false;
         }
 
@@ -942,6 +1043,9 @@ namespace
         if (g_createFileATarget != nullptr) {
             MH_DisableHook(g_createFileATarget);
         }
+        if (g_bsResourceNiBinaryStreamCtorTarget != nullptr) {
+            MH_DisableHook(g_bsResourceNiBinaryStreamCtorTarget);
+        }
     }
 
     void UninitializeHookEngine()
@@ -956,6 +1060,10 @@ namespace
         if (g_createFileATarget != nullptr) {
             MH_RemoveHook(g_createFileATarget);
             g_createFileATarget = nullptr;
+        }
+        if (g_bsResourceNiBinaryStreamCtorTarget != nullptr) {
+            MH_RemoveHook(g_bsResourceNiBinaryStreamCtorTarget);
+            g_bsResourceNiBinaryStreamCtorTarget = nullptr;
         }
         MH_Uninitialize();
     }
@@ -1048,6 +1156,90 @@ namespace
             });
     }
 
+    RE::BSResourceNiBinaryStream* HookedBSResourceNiBinaryStreamCtor(
+        RE::BSResourceNiBinaryStream* self,
+        const char* name,
+        bool writeable,
+        RE::BSResource::Location* optionalStart)
+    {
+        static REL::Relocation<BSResourceNiBinaryStreamCtor_t> s_ctor{ RE::Offset::BSResourceNiBinaryStream::Ctor };
+        const auto original = g_originalBSResourceNiBinaryStreamCtor != nullptr ? g_originalBSResourceNiBinaryStreamCtor : s_ctor.get();
+        if (original == nullptr) {
+            return self;
+        }
+
+        if (g_inHook) {
+            return original(self, name, writeable, optionalStart);
+        }
+
+        HookReentryGuard reentry;
+        if (!reentry.active) {
+            return original(self, name, writeable, optionalStart);
+        }
+
+        ActiveHookCallGuard inFlight;
+        if (!g_runtimeEnabled.load(std::memory_order_acquire) ||
+            g_logger == nullptr ||
+            !g_config.traceBsaEntries) {
+            return original(self, name, writeable, optionalStart);
+        }
+
+        const auto startTick = std::chrono::steady_clock::now();
+        const auto startWall = std::chrono::system_clock::now();
+
+        const auto stream = original(self, name, writeable, optionalStart);
+        const DWORD lastError = ::GetLastError();
+
+        const bool success = stream != nullptr && stream->good();
+        const auto durationMs = static_cast<std::uint32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTick).count());
+
+        const bool isLooseFileStream =
+            success &&
+            stream->stream != nullptr &&
+            skyrim_cast<RE::BSResource::LooseFileStream*>(stream->stream.get()) != nullptr;
+
+        if (!isLooseFileStream &&
+            name != nullptr &&
+            name[0] != '\0' &&
+            (success || g_config.logFailedOpen) &&
+            durationMs >= g_config.minDurationMs) {
+            RawEvent event{};
+            event.timestamp = startWall;
+            event.threadId = ::GetCurrentThreadId();
+            event.source = EventSource::kBsaEntry;
+            event.success = success;
+            event.durationMs = durationMs;
+            event.desiredAccess = writeable ? GENERIC_WRITE : GENERIC_READ;
+            event.shareMode = FILE_SHARE_READ;
+            event.creationDisposition = OPEN_EXISTING;
+            event.lastError = success ? ERROR_SUCCESS : lastError;
+            event.path = ResolveResourcePathForLog(AnsiToWide(name));
+
+            if (optionalStart != nullptr) {
+                if (const auto* locationName = optionalStart->DoGetName();
+                    locationName != nullptr && locationName[0] != '\0') {
+                    event.context = AnsiToWide(locationName);
+                }
+            }
+
+            if (event.context.empty() && stream->stream != nullptr) {
+                RE::BSFixedString streamName;
+                if (stream->stream->DoGetName(streamName)) {
+                    const auto* rawStreamName = streamName.c_str();
+                    if (rawStreamName != nullptr && rawStreamName[0] != '\0') {
+                        event.context = AnsiToWide(rawStreamName);
+                    }
+                }
+            }
+
+            g_logger->TryEnqueue(std::move(event));
+        }
+
+        ::SetLastError(lastError);
+        return stream;
+    }
+
     HANDLE WINAPI HookedCreateFileA(
         LPCSTR fileName,
         DWORD desiredAccess,
@@ -1105,9 +1297,10 @@ namespace
 
         g_runtimeEnabled.store(true, std::memory_order_release);
         SKSE::log::info(
-            "FileTraceSKSE enabled. ini={} log={}",
+            "FileTraceSKSE enabled. ini={} log={} trace_bsa_entries={}",
             WideToUtf8(g_config.iniPath.wstring()),
-            WideToUtf8(g_logger->GetLogPath().wstring()));
+            WideToUtf8(g_logger->GetLogPath().wstring()),
+            g_config.traceBsaEntries ? 1 : 0);
         return true;
     }
 
